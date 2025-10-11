@@ -16,3 +16,17 @@ Idea: TriposTutor
 - Model via gemini-1.5-flash
 - JSON data storage
 - PDF parsing
+
+
+TriposTutor is an AI-powered revision app that helps Cambridge Computer Science students practise Tripos questions interactively.
+It extracts past-paper questions from PDFs and acts as a supervisor chatbot — giving gentle, tiered hints instead of full solutions.
+Built entirely in one Python file using PyQt6 for the GUI and Google Gemini for AI hints.
+
+🚀 Features
+🧩 Automatic question extraction from Tripos PDFs (e.g. 2021_1.pdf, 2022_2.pdf)
+🔍 Topic search — find questions by typing “recursion”, “graphs”, etc.
+💬 Supervisor-style chat with Gemini (tiered hint levels)
+🎓 Hints, not answers — /hint, /next, /skip, /show_answer
+💾 Session saving — chat logs, progress, solved status
+🧠 Optional semantic search using Sentence Transformers + FAISS
+🖥️ Clean PyQt6 interface, all contained in a single file
