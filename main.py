@@ -3,12 +3,14 @@ import io
 import json
 import os
 import re
-import sys
+import sys, random
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+GEMINI_API_KEY = "AIzaSyDamaXEf7v-XvvEsfkSkgvDVAxMMog05hM"
 
 # UI
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
@@ -53,7 +55,7 @@ try:
     from dotenv import load_dotenv  # type: ignore
 
     load_dotenv()
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyDamaXEf7v-XvvEsfkSkgvDVAxMMog05hM")
     if GEMINI_API_KEY:
         genai.configure(api_key=GEMINI_API_KEY)
         GEMINI_MODEL = "gemini-2.0-flash-exp"
@@ -95,149 +97,161 @@ for d in (DATA_DIR, SESSIONS_DIR, PDF_DIR, CACHE_DIR):
 # PDF extraction & DB build
 # =========================
 def extract_questions_bulletproof(pdf_path: Path) -> List[Dict[str, Any]]:
-    """Extract candidate questions from a PDF using multiple heuristics.
-
-    Returns list of dicts: {'qnum': int, 'page': int, 'text': str, 'confidence': str}
+    """
+    ULTRA-ROBUST question extraction - line-by-line processing.
+    Returns: list of {qnum, page, text, confidence}
     """
     if not PdfReader:
         raise RuntimeError("pypdf not installed")
-
+    
+    print(f"  Extracting from {pdf_path.name}...")
     reader = PdfReader(str(pdf_path))
-    all_text: List[Tuple[int, str]] = []
+    
+    # Process line-by-line (more robust than full-text regex)
+    questions = []
+    current_q = None
+    
     for page_num, page in enumerate(reader.pages, start=1):
         try:
             text = page.extract_text() or ""
-        except Exception:
-            text = ""
-        all_text.append((page_num, text))
-
-    full_text = ""
-    page_starts: Dict[int, int] = {}
-    current_pos = 0
-    for page_num, text in all_text:
-        page_starts[current_pos] = page_num
-        full_text += f"\n<<<PAGE_{page_num}>>>\n" + text
-        current_pos = len(full_text)
-
-    # Primary pattern: question numbers at line starts followed by content
-    pattern = (
-        r"(?:^|\n)(?:SECTION\s+[A-Z]\s+)?(\d{1,2})[\s.)\]]+"
-        r"([^\n]{20,}(?:\n(?!\d{1,2}[\s.)\]]).*?){1,}?)(?=\n\d{1,2}[\s.)\]]|\n(?:SECTION|END OF|CST\d)|\Z)"
-    )
-    matches = list(re.finditer(pattern, full_text, re.MULTILINE | re.DOTALL))
-
-    questions: List[Dict[str, Any]] = []
-    for match in matches:
-        qnum = int(match.group(1))
-        text = match.group(2).strip()
-        match_pos = match.start()
-        page_num = 1
-        for pos in sorted(page_starts.keys(), reverse=True):
-            if match_pos >= pos:
-                page_num = page_starts[pos]
-                break
-        text = re.sub(r"<<<PAGE_\d+>>>", "", text)
-        text = re.sub(r"\s+", " ", text).strip()
-        if len(text) > 100:
-            questions.append({"qnum": qnum, "page": page_num, "text": text[:3000], "confidence": "high"})
-
-    # Deduplicate by qnum (keep longest)
-    dedup: Dict[int, Dict[str, Any]] = {}
-    for q in questions:
-        key = q["qnum"]
-        if key not in dedup or len(q["text"]) > len(dedup[key]["text"]):
-            dedup[key] = q
-    questions = sorted(dedup.values(), key=lambda x: x["qnum"])
-
-    # If too few found, try section-based
-    if len(questions) < 3:
-        sections = re.split(r"\n(?=SECTION\s+[A-Z])", full_text)
-        for section in sections:
-            if len(section) > 200:
-                qmatch = re.search(r"^(\d{1,2})", section, re.MULTILINE)
-                if qmatch:
-                    qnum = int(qmatch.group(1))
-                    txt = re.sub(r"<<<PAGE_\d+>>>", "", section)
-                    txt = re.sub(r"\s+", " ", txt).strip()[:3000]
-                    if qnum not in dedup:
-                        questions.append({"qnum": qnum, "page": 1, "text": txt, "confidence": "medium"})
-
-    # Last resort: page-based
+            # Normalize immediately
+            text = normalize_text(text)
+        except Exception as e:
+            print(f"  [WARN] Page {page_num} extraction failed: {e}")
+            continue
+        
+        lines = text.split('\n')
+        
+        for line in lines:
+            # Match question patterns: "1 ", "1. ", "1)", "Question 1", etc.
+            match = re.match(r'^(?:\s*)((?:Question\s+)?(\d{1,2})[.)\s:]+)(.*)$', line, re.IGNORECASE)
+            
+            if match:
+                qnum = int(match.group(2))
+                
+                # Save previous question
+                if current_q and len(current_q['text']) > 20:
+                    questions.append(current_q)
+                
+                # Start new question
+                current_q = {
+                    'qnum': qnum,
+                    'page': page_num,
+                    'text': match.group(3).strip(),
+                    'confidence': 'high'
+                }
+            elif current_q:
+                # Continue current question
+                current_q['text'] += ' ' + line.strip()
+    
+    # Don't forget last question
+    if current_q and len(current_q['text']) > 20:
+        questions.append(current_q)
+    
+    # Fallback: If no questions found, use page-based splitting
     if not questions:
-        for page_num, text in all_text:
-            text = text.strip()
-            if len(text) > 200:
-                questions.append({"qnum": page_num, "page": page_num, "text": text[:3000], "confidence": "low"})
-
+        print(f"  [WARN] No question markers found, using page-based extraction")
+        for page_num, page in enumerate(reader.pages, start=1):
+            try:
+                text = normalize_text(page.extract_text() or "")
+                if len(text.strip()) > 50:
+                    questions.append({
+                        'qnum': page_num,
+                        'page': page_num,
+                        'text': text.strip(),
+                        'confidence': 'medium'
+                    })
+            except:
+                pass
+    
+    # Clean up question text
+    for q in questions:
+        # Remove excessive whitespace
+        q['text'] = re.sub(r'\s+', ' ', q['text']).strip()
+        # Limit to reasonable length
+        if len(q['text']) > 5000:
+            q['text'] = q['text'][:5000] + "..."
+    
+    print(f"  ✓ Extracted {len(questions)} questions")
     return questions
 
 
-def build_or_load_db(force_rebuild: bool = False) -> List[Dict[str, Any]]:
-    """Build the JSON DB from PDFs in PDF_DIR or load existing DB."""
+def build_or_load_db(force_rebuild=False):
+    """
+    Build comprehensive database with metadata
+    """
     if DB_PATH.exists() and not force_rebuild:
         try:
-            with open(DB_PATH, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            # Ensure fields
-            fixed = False
-            for item in data:
-                if "page" not in item:
-                    item["page"] = item.get("qnum", 1)
-                    fixed = True
-                if "id" not in item:
-                    fn = item.get("filename", "unknown")
-                    qn = item.get("qnum", 1)
-                    pg = item.get("page", 1)
-                    item["id"] = f"{fn}__q{qn}_p{pg}"
-                    fixed = True
-            if fixed:
-                with open(DB_PATH, "w", encoding="utf-8") as fh:
-                    json.dump(data, fh, indent=2, ensure_ascii=False)
-            return data
-        except Exception:
-            pass
-
-    all_questions: List[Dict[str, Any]] = []
-    pdf_files = sorted([p for p in PDF_DIR.glob("*.pdf")])
+            with open(DB_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                print(f"✓ Loaded {len(data)} questions from cache")
+                return data
+        except:
+            print("⚠ Cache corrupted, rebuilding...")
+    
+    # Backup old DB before rebuilding
+    if DB_PATH.exists():
+        backup_path = DATA_DIR / "tripos_questions.backup.json"
+        import shutil
+        shutil.copy(DB_PATH, backup_path)
+        print(f"[BUILD DB] Backed up old database to {backup_path.name}")
+    
+    print("\n🔨 Building question database...")
+    all_questions = []
+    
+    pdf_files = sorted([f for f in PDF_DIR.glob("*.pdf")])
+    
     if not pdf_files:
-        print(f"⚠ No PDFs in {PDF_DIR}")
+        print(f"⚠ No PDF files found in {PDF_DIR}")
         return []
-
+    
+    print(f"[BUILD DB] Found {len(pdf_files)} PDF files")
+    
     for path in pdf_files:
         try:
             questions = extract_questions_bulletproof(path)
+            print(f"[BUILD DB] {path.name}: extracted {len(questions)} questions")
+            
+            # Show a sample of extracted text for first question
+            if questions and len(questions) > 0:
+                sample_text = questions[0]['text'][:100]
+                print(f"  Sample: {sample_text}...")
+                
         except Exception as exc:
-            print(f"Error extracting {path.name}: {exc}")
+            print(f"[BUILD DB] Error extracting {path.name}: {exc}")
             continue
-
+        
+        # Parse filename for metadata
         fname = path.name
         year = None
         paper = None
-        m = re.search(r"(\d{4})", fname)
+        m = re.search(r'(\d{4})', fname)
         if m:
             year = int(m.group(1))
-        m = re.search(r"[_\-\s](\d)(?:\D|$)", fname)
+        m = re.search(r'[_\-\s](\d)(?:\D|$)', fname)
         if m:
             paper = int(m.group(1))
-
+        
         for q in questions:
             item = {
                 "id": f"{fname}__q{q['qnum']}_p{q['page']}",
                 "filename": fname,
                 "year": year,
                 "paper": paper,
-                "qnum": q["qnum"],
-                "page": q["page"],
-                "text": q["text"],
-                "confidence": q["confidence"],
+                "qnum": q['qnum'],
+                "page": q['page'],
+                "text": q['text'],
+                "confidence": q['confidence'],
                 "topics": [],
-                "difficulty": None,
+                "difficulty": None
             }
             all_questions.append(item)
-
-    with open(DB_PATH, "w", encoding="utf-8") as fh:
-        json.dump(all_questions, fh, indent=2, ensure_ascii=False)
-    print(f"✓ Built DB with {len(all_questions)} questions")
+    
+    # Save
+    with open(DB_PATH, "w", encoding="utf-8") as f:
+        json.dump(all_questions, f, indent=2, ensure_ascii=False)
+    
+    print(f"✓ Built database with {len(all_questions)} questions from {len(pdf_files)} PDFs\n")
     return all_questions
 
 
@@ -246,6 +260,18 @@ def build_or_load_db(force_rebuild: bool = False) -> List[Dict[str, Any]]:
 # =========================
 embeddings_index: Optional[Dict[str, Any]] = None
 
+def normalize_text(text: str) -> str:
+    """Normalize text for better searching - handle ligatures and unicode."""
+    import unicodedata
+    # Normalize unicode (handle ligatures like ﬀ, ﬁ, ﬂ)
+    text = unicodedata.normalize('NFKD', text)
+    # Replace common ligatures that might not normalize
+    replacements = {
+        'ﬀ': 'ff', 'ﬁ': 'fi', 'ﬂ': 'fl', 'ﬃ': 'ffi', 'ﬄ': 'ffl',
+        'ﬅ': 'st', 'ﬆ': 'st',}
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text
 
 def build_embeddings_if_needed(db: List[Dict[str, Any]]) -> None:
     """Build embedding index if EMBEDDER is available (optional)."""
@@ -263,30 +289,67 @@ def build_embeddings_if_needed(db: List[Dict[str, Any]]) -> None:
 # =========================
 def search_questions(db: List[Dict[str, Any]], query: str, top_k: int = 20) -> List[Tuple[Dict[str, Any], float]]:
     """Search DB for query (token matching fallback)."""
-    q = query.strip().lower()
+    q = normalize_text(query.strip().lower())
     if not q:
         return []
-    valid_db = [item for item in db if len(item.get("text", "")) > 100 and not re.match(r"^\s*[\d\W]+\s*$", item.get("text", ""))]
+    
+    # DEBUG: Print database size
+    print(f"[DEBUG] Database has {len(db)} total questions")
+    
+    # Show sample of what's in the database
+    if db:
+        sample = db[0]
+        sample_text = normalize_text(sample.get('text', ''))
+        print(f"[DEBUG] Sample question text (first 200 chars): {sample_text[:200]}")
+        print(f"[DEBUG] Sample filename: {sample.get('filename', 'N/A')}")
+    
+    # More lenient filtering - only require 50 chars minimum
+    valid_db = [item for item in db if len(item.get("text", "")) > 50]
+    print(f"[DEBUG] After filtering: {len(valid_db)} valid questions")
+    
     if not valid_db:
+        print("[DEBUG] No valid questions found, using all DB entries")
         valid_db = db
+    
     results: List[Tuple[Dict[str, Any], float]] = []
-    # If embeddings available, could use; keep simple for now
     tokens = set(q.split())
-    for item in valid_db:
-        text = (item.get("text") or "").lower()
-        filename = (item.get("filename") or "").lower()
+    print(f"[DEBUG] Search tokens: {tokens}")
+    
+    for idx, item in enumerate(valid_db):
+        text = normalize_text(item.get("text") or "").lower()
+        filename = normalize_text(item.get("filename") or "").lower()
         score = 0
+        
+        # Exact phrase match
         if q in text:
             score += 1000
+        
+        # Token matching
         text_tokens = set(text.split())
         matching = tokens.intersection(text_tokens)
         score += len(matching) * 100
+        
+        # Filename matching
         for token in tokens:
             if token in filename:
                 score += 50
+        
         if score > 0:
             normalized = score / (1 + len(text) / 1000)
             results.append((item, normalized))
+        
+        # Show why first few items didn't match
+        if idx < 3 and score == 0:
+            preview = text[:150] if text else "(empty)"
+            print(f"[DEBUG] Question {idx+1} (score=0): {preview}...")
+    
+    print(f"[DEBUG] Found {len(results)} matches for query '{q}'")
+    
+    # If no results, return ALL questions so user can see what's available
+    if not results:
+        print("[DEBUG] No matches found - returning all questions for browsing")
+        results = [(item, 1.0) for item in valid_db[:top_k]]
+    
     results.sort(key=lambda x: x[1], reverse=True)
     return results[:top_k]
 
@@ -330,7 +393,7 @@ def load_session_log(question_id: str) -> List[Dict[str, str]]:
 # Gemini wrapper
 # =========================
 def ask_gemini_supervisor(question_text: str, user_message: str, chat_history_str: str, hint_level: int = 1) -> str:
-    """Ask Gemini for a hint/explanation; fallback to canned hints if not available."""
+    """Ask Gemini for a hint/explanation with more conversational and context-aware responses."""
     if not MODEL_AVAILABLE:
         hints = {
             1: "💡 Think about the fundamental concept here. What's the core idea?",
@@ -340,39 +403,77 @@ def ask_gemini_supervisor(question_text: str, user_message: str, chat_history_st
         return hints.get(hint_level, "Set GEMINI_API_KEY to enable AI hints.")
 
     try:
-        system_prompt = (
-            "You are an exceptional Cambridge Computer Science supervisor.\n\n"
-            "Your teaching philosophy:\n- Socratic method: Guide students to discover answers themselves\n"
-            "- Be encouraging and supportive\n- Use analogies and examples\n- Ask probing questions\n- Never give away the full answer unless explicitly requested with /show_answer\n\n"
-            "Student level: Cambridge Computer Science Tripos\nTone: Friendly but academically rigorous"
-        )
-        level_instructions = {
-            1: "Give a gentle conceptual nudge. Ask a leading question. 1-2 sentences max.",
-            2: "Outline the approach without calculations. What steps should they take?",
-            3: "Provide a detailed roadmap with intermediate checkpoints, but no final answer.",
+        # More elaborate system prompt to create a more engaging persona
+        system_prompt = """You are an exceptional Cambridge Computer Science supervisor named Dr. Alex Thompson. 
+Your teaching philosophy:
+- Use the Socratic method to guide students to discover answers
+- Be encouraging, supportive, and slightly witty
+- Provide context and relate concepts to real-world scenarios
+- Ask probing questions that help students think critically
+- Adapt your explanation style based on the student's previous responses
+- Never give away the full answer unless explicitly requested
+
+Communication style:
+- Conversational but academically rigorous
+- Use analogies and relatable examples
+- Show genuine interest in the student's learning process
+- Vary your response length and depth based on the student's understanding
+
+Student level: Cambridge Computer Science Tripos
+Tone: Friendly, patient, intellectually stimulating"""
+
+        # Dynamic instruction based on conversation context and hint level
+        context_instructions = {
+            1: "Provide a gentle, thought-provoking nudge. Ask a leading question that hints at the solution approach.",
+            2: "Give a more substantial guidance, outlining key considerations and potential solution strategies without revealing too much.",
+            3: "Offer a comprehensive roadmap, breaking down the problem into manageable steps and explaining the reasoning behind each step.",
         }
-        instruct = level_instructions.get(hint_level, level_instructions[1])
+        instruct = context_instructions.get(hint_level, context_instructions[1])
+
+        # Analyze previous chat history for context
+        prev_context = "No previous context" if not chat_history_str else chat_history_str[-1000:]
+
+        # Craft a prompt that encourages a more natural, context-aware response
         prompt = f"""{system_prompt}
 
-QUESTION:
+SPECIFIC QUESTION CONTEXT:
 {question_text[:1000]}
 
-CONVERSATION SO FAR:
-{chat_history_str[-500:]}
+PREVIOUS CONVERSATION:
+{prev_context}
 
 INSTRUCTION: {instruct}
 
-Student says: {user_message}
+Student's latest message: {user_message}
 
-Your response:"""
+Generate a response that:
+1. Acknowledges the student's current level of understanding
+2. Provides targeted guidance
+3. Encourages further thinking
+4. Maintains an engaging, supportive tone"""
 
         model = genai.GenerativeModel(GEMINI_MODEL)
         response = model.generate_content(prompt)
+        
+        # Add some randomness to prevent repetitive responses
         if hasattr(response, "text"):
-            return response.text.strip()
+            text = response.text.strip()
+            # Add minor variations to make responses feel more natural
+            variations = [
+                "Hmm, interesting approach. ",
+                "Let's dig a bit deeper. ",
+                "That's a great starting point. ",
+                "I see where you're going with this. ",
+            ]
+            if text and random.random() < 0.3:  # 30% chance of adding a variation
+                text = random.choice(variations) + text
+            return text
+        
         return str(response)
+    
     except Exception as exc:
         return f"⚠ AI Error: {exc}"
+
 
 
 # =========================
@@ -523,6 +624,67 @@ class TriposTutorGUI(QWidget):
         left_layout.addWidget(results_label)
 
         self.list_widget = QListWidget()
+
+        self.list_widget.setStyleSheet("""
+        QListWidget {
+            background-color: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 10px;
+            padding: 6px;
+            font-size: 13px;
+            color: #e2e8f0;
+            outline: none;
+        }
+
+        QListWidget::item {
+            background-color: transparent;
+            padding: 10px 8px;
+            margin: 4px 0;
+            border-radius: 8px;
+            line-height: 1.3em;
+        }
+
+        QListWidget::item:hover {
+            background-color: #1e293b;
+            border: 1px solid #3b82f6;
+        }
+
+        QListWidget::item:selected {
+            background-color: #3b82f6;
+            color: white;
+            font-weight: 600;
+            border: 1px solid #60a5fa;
+        }
+
+        QListWidget::item:selected:!active {
+            background-color: #2563eb;
+            color: #fff;
+        }
+
+        QListWidget QScrollBar:vertical {
+            background: #0f172a;
+            width: 10px;
+            margin: 8px 0 8px 0;
+            border-radius: 8px;
+        }
+
+        QListWidget QScrollBar::handle:vertical {
+            background: #334155;
+            min-height: 20px;
+            border-radius: 8px;
+        }
+
+        QListWidget QScrollBar::handle:vertical:hover {
+            background: #475569;
+        }
+
+        QListWidget QScrollBar::add-line:vertical,
+        QListWidget QScrollBar::sub-line:vertical {
+            height: 0px;
+        }
+    """)
+
+
         self.list_widget.itemClicked.connect(self.on_question_selected)
         left_layout.addWidget(self.list_widget)
 
