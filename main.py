@@ -31,7 +31,7 @@ try:
     import google.generativeai as genai
     from dotenv import load_dotenv
     load_dotenv()
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "ENTERKEYHERE")
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
     if GEMINI_API_KEY:
         genai.configure(api_key=GEMINI_API_KEY)
         GEMINI_MODEL = "gemini-2.0-flash-exp"
@@ -82,67 +82,106 @@ def extract_questions_bulletproof(pdf_path):
     print(f"  Extracting from {pdf_path.name}...")
     reader = PdfReader(str(pdf_path))
     
-    # Strategy 1: Look for clear question markers
-    questions = []
-    current_q = None
-    
+    # Extract all text first
+    all_text = []
     for page_num, page in enumerate(reader.pages, start=1):
         try:
             text = page.extract_text() or ""
+            all_text.append((page_num, text))
         except:
             continue
-        
-        lines = text.split('\n')
-        
-        for line in lines:
-            # Match question patterns: "1 ", "1. ", "1)", "Question 1", etc.
-            match = re.match(r'^(?:\s*)((?:Question\s+)?(\d{1,2})[.)\s:]+)(.*)$', line, re.IGNORECASE)
-            
-            if match:
-                qnum = int(match.group(2))
-                
-                # Save previous question
-                if current_q and len(current_q['text']) > 20:
-                    questions.append(current_q)
-                
-                # Start new question
-                current_q = {
-                    'qnum': qnum,
-                    'page': page_num,
-                    'text': match.group(3).strip(),
-                    'confidence': 'high'
-                }
-            elif current_q:
-                # Continue current question
-                current_q['text'] += ' ' + line.strip()
     
-    # Don't forget last question
-    if current_q and len(current_q['text']) > 20:
-        questions.append(current_q)
+    # Combine all text with page markers
+    full_text = ""
+    page_starts = {}
+    current_pos = 0
     
-    # Strategy 2: If no questions found, use page-based splitting
+    for page_num, text in all_text:
+        page_starts[current_pos] = page_num
+        full_text += f"\n<<<PAGE_{page_num}>>>\n" + text
+        current_pos = len(full_text)
+    
+    # Strategy 1: Find questions using various patterns
+    questions = []
+    
+    # Pattern matches: "3", "Question 3", etc. at start of line
+    # More strict - requires substantial content after
+
+
+    pattern = r'(?:^|\n)(?:SECTION\s+[A-Z]\s+)?(\d{1,2})[\s.)\]]+([^\n]{20,}(?:\n(?!\d{1,2}[\s.)\]]).*?){1,}?)(?=\n\d{1,2}[\s.)\]]|\n(?:SECTION|END OF|CST\d)|\Z)'
+    
+    matches = re.finditer(pattern, full_text, re.MULTILINE | re.DOTALL)
+    
+    for match in matches:
+        qnum = int(match.group(1))
+        text = match.group(2).strip()
+        
+        # Find which page this starts on
+        match_pos = match.start()
+        page_num = 1
+        for pos in sorted(page_starts.keys(), reverse=True):
+            if match_pos >= pos:
+                page_num = page_starts[pos]
+                break
+        
+        # Clean up text
+        text = re.sub(r'<<<PAGE_\d+>>>', '', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        # Only include if substantial
+        if len(text) > 100:
+            questions.append({
+                'qnum': qnum,
+                'page': page_num,
+                'text': text[:3000],  # Reasonable limit
+                'confidence': 'high'
+            })
+    
+    # Deduplicate by question number - keep longest text
+    deduped = {}
+    for q in questions:
+        key = q['qnum']
+        if key not in deduped or len(q['text']) > len(deduped[key]['text']):
+            deduped[key] = q
+    
+    questions = sorted(deduped.values(), key=lambda x: x['qnum'])
+    
+    # Strategy 2: If too few found, try section-based extraction
+    if len(questions) < 3:
+        print(f"  ⚠ Only found {len(questions)} questions, trying section-based extraction")
+        
+        # Look for SECTION markers
+        sections = re.split(r'\n(?=SECTION\s+[A-Z])', full_text)
+        
+        for section in sections:
+            if len(section) > 200:
+                # Try to find question number
+                qmatch = re.search(r'^(\d{1,2})', section, re.MULTILINE)
+                if qmatch:
+                    qnum = int(qmatch.group(1))
+                    text = re.sub(r'<<<PAGE_\d+>>>', '', section)
+                    text = re.sub(r'\s+', ' ', text).strip()[:3000]
+                    
+                    if qnum not in deduped:
+                        questions.append({
+                            'qnum': qnum,
+                            'page': 1,
+                            'text': text,
+                            'confidence': 'medium'
+                        })
+    
+    # Strategy 3: Last resort - page-based
     if not questions:
         print(f"  ⚠ No question markers found, using page-based extraction")
-        for page_num, page in enumerate(reader.pages, start=1):
-            try:
-                text = page.extract_text() or ""
-                if len(text.strip()) > 50:
-                    questions.append({
-                        'qnum': page_num,
-                        'page': page_num,
-                        'text': text.strip(),
-                        'confidence': 'medium'
-                    })
-            except:
-                pass
-    
-    # Clean up question text
-    for q in questions:
-        # Remove excessive whitespace
-        q['text'] = re.sub(r'\s+', ' ', q['text']).strip()
-        # Limit to reasonable length for storage
-        if len(q['text']) > 5000:
-            q['text'] = q['text'][:5000] + "..."
+        for page_num, text in all_text:
+            text = text.strip()
+            if len(text) > 200:
+                questions.append({
+                    'qnum': page_num,
+                    'page': page_num,
+                    'text': text[:3000],
+                    'confidence': 'low'
+                })
     
     print(f"  ✓ Extracted {len(questions)} questions")
     return questions
@@ -156,10 +195,29 @@ def build_or_load_db(force_rebuild=False):
         try:
             with open(DB_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
+                
+                # Validate and fix database entries
+                fixed_count = 0
+                for item in data:
+                    if 'page' not in item:
+                        item['page'] = item.get('qnum', 1)
+                        fixed_count += 1
+                    if 'id' not in item:
+                        fn = item.get('filename', 'unknown')
+                        qn = item.get('qnum', 1)
+                        pg = item.get('page', 1)
+                        item['id'] = f"{fn}__q{qn}_p{pg}"
+                        fixed_count += 1
+                
+                if fixed_count > 0:
+                    print(f"⚠ Fixed {fixed_count} database entries")
+                    with open(DB_PATH, "w", encoding="utf-8") as f:
+                        json.dump(data, f, indent=2, ensure_ascii=False)
+                
                 print(f"✓ Loaded {len(data)} questions from cache")
                 return data
-        except:
-            print("⚠ Cache corrupted, rebuilding...")
+        except Exception as e:
+            print(f"⚠ Cache error ({e}), rebuilding...")
     
     print("\n🔨 Building question database...")
     all_questions = []
@@ -244,28 +302,45 @@ def search_questions(db, query, top_k=20):
     if not q:
         return []
     
+    # Filter out junk entries (too short, just code snippets, etc.)
+    valid_db = []
+    for item in db:
+        text = item.get('text', '')
+        # Only include if: has substantial text AND is not just numbers/symbols
+        if len(text) > 100 and not re.match(r'^\s*[\d\W]+\s*$', text):
+            valid_db.append(item)
+    
+    if not valid_db:
+        valid_db = db  # Fall back to full DB if filtering removes everything
+    
     results = []
     
     # Strategy 1: Semantic search (best)
     if USE_EMBEDDINGS and EMBEDDER and embeddings_index:
         query_emb = EMBEDDER.encode([q])[0]
-        embs = embeddings_index["embs"]
-        ids = embeddings_index["ids"]
+        
+        # Rebuild index with only valid entries
+        valid_ids = set([item['id'] for item in valid_db])
+        id_to_idx = {item_id: idx for idx, item_id in enumerate(embeddings_index['ids']) if item_id in valid_ids}
         
         def cosine_sim(a, b):
             return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-10))
         
-        sims = [cosine_sim(query_emb, e) for e in embs]
+        sims = []
+        for item_id, idx in id_to_idx.items():
+            sim = cosine_sim(query_emb, embeddings_index['embs'][idx])
+            sims.append((item_id, sim))
         
         # Dynamic threshold based on query specificity
         threshold = 0.25 if len(q.split()) <= 2 else 0.30
         
-        id_to_q = {item["id"]: item for item in db}
-        ranked = [(ids[i], sims[i]) for i in range(len(sims)) if sims[i] >= threshold]
+        id_to_q = {item["id"]: item for item in valid_db}
+        ranked = [(item_id, score) for item_id, score in sims if score >= threshold]
         ranked.sort(key=lambda x: x[1], reverse=True)
         
-        for idx, score in ranked[:top_k]:
-            results.append((id_to_q[idx], float(score)))
+        for item_id, score in ranked[:top_k]:
+            if item_id in id_to_q:
+                results.append((id_to_q[item_id], float(score)))
         
         if results:
             print(f"🔍 Found {len(results)} semantic matches (threshold={threshold:.2f})")
@@ -275,7 +350,7 @@ def search_questions(db, query, top_k=20):
     print(f"🔍 Using keyword search for '{query}'")
     query_tokens = set(q.split())
     
-    for item in db:
+    for item in valid_db:
         text = (item.get("text") or "").lower()
         filename = (item.get("filename") or "").lower()
         
@@ -292,9 +367,10 @@ def search_questions(db, query, top_k=20):
         
         # Partial word matches
         for qtoken in query_tokens:
-            for ttoken in text_tokens:
-                if qtoken in ttoken or ttoken in qtoken:
-                    score += 10
+            if len(qtoken) > 3:  # Only for longer words
+                for ttoken in text_tokens:
+                    if qtoken in ttoken or ttoken in qtoken:
+                        score += 10
         
         # Filename boost
         for token in query_tokens:
@@ -313,6 +389,13 @@ def search_questions(db, query, top_k=20):
                 score += 100
             elif first_match_pos < 500:
                 score += 50
+        
+        # Boost longer questions (more content = more useful)
+        text_len = len(text)
+        if text_len > 500:
+            score += 20
+        if text_len > 1000:
+            score += 20
         
         if score > 0:
             # Normalize by text length to favor concise matches
@@ -692,7 +775,7 @@ class TriposTutorGUI(QWidget):
         
         self.question_scroll = QScrollArea()
         self.question_scroll.setWidget(self.question_image)
-        self.question_scroll.setWidgetResizable(False)
+        self.question_scroll.setWidgetResizable(True)
         self.question_scroll.setMinimumHeight(400)
         right_layout.addWidget(self.question_scroll, stretch=4)
         
@@ -709,7 +792,7 @@ class TriposTutorGUI(QWidget):
         
         self.question_box = QTextEdit()
         self.question_box.setReadOnly(True)
-        self.question_box.setMaximumHeight(100)
+        self.question_box.setMinimumHeight(400)
         right_layout.addWidget(self.question_box)
         
         # Chat
@@ -736,7 +819,7 @@ class TriposTutorGUI(QWidget):
         self.hint_btn.setToolTip("Get a hint")
         self.hint_btn.clicked.connect(self.on_hint)
         input_layout.addWidget(self.hint_btn)
-        
+
         self.next_btn = QPushButton("⏭️")
         self.next_btn.setToolTip("Next question")
         self.next_btn.clicked.connect(self.on_next)
@@ -779,9 +862,15 @@ class TriposTutorGUI(QWidget):
         
         self.list_widget.clear()
         for item, score in matches:
-            title = f"{item['filename']} Q{item['qnum']} (Page {item['page']})"
-            snippet = item['text'][:120].replace('\n', ' ')
-            confidence = item.get('confidence', 'high')
+            # Safely get values with defaults
+            filename = item.get('filename', 'Unknown')
+            qnum = item.get('qnum', '?')
+            page = item.get('page', '?')
+            text = item.get('text', '')
+            confidence = item.get('confidence', 'medium')
+            
+            title = f"{filename} Q{qnum} (Page {page})"
+            snippet = text[:120].replace('\n', ' ') if text else "No text available"
             
             list_item = QListWidgetItem(f"{title}\n{snippet}...\n[{confidence} confidence, score: {score:.2f}]")
             self.list_widget.addItem(list_item)
@@ -802,30 +891,39 @@ class TriposTutorGUI(QWidget):
     
     def show_question(self, item):
         self.current_question = item
+        
+        # Safely extract question details
+        filename = item.get('filename', 'Unknown')
+        qnum = item.get('qnum', '?')
+        page = item.get('page', '?')
+        text = item.get('text', 'No text available')
+        
         self.question_box.setPlainText(
-            f"[{item['filename']}] Q{item['qnum']} (Page {item['page']})\n\n{item['text']}"
+            f"[{filename}] Q{qnum} (Page {page})\n\n{text}"
         )
         
         # Load chat history
-        self.chat_history = load_session_log(item["id"])
+        question_id = item.get("id", f"{filename}_q{qnum}")
+        self.chat_history = load_session_log(question_id)
         self.refresh_chat()
         
         # Load PDF with threading
-        pdf_path = PDF_DIR / item['filename']
+        pdf_path = PDF_DIR / filename
         if pdf_path.exists():
             self.progress_bar.setVisible(True)
             self.progress_bar.setRange(0, 0)  # Indeterminate
             self.progress_bar.setFormat("Loading PDF...")
             
-            self.pdf_loader = PDFLoaderThread(pdf_path, item['page'])
+            target_page = page if isinstance(page, int) else 1
+            self.pdf_loader = PDFLoaderThread(pdf_path, target_page)
             self.pdf_loader.finished.connect(self.on_pdf_loaded)
             self.pdf_loader.error.connect(self.on_pdf_error)
             self.pdf_loader.start()
         else:
-            self.question_image.setText("📄 PDF not found")
+            self.question_image.setText(f"📄 PDF not found: {filename}")
         
         self.hint_level = 1
-        self.status.setText(f"📖 Question {item['qnum']} from {item['filename']}")
+        self.status.setText(f"📖 Question {qnum} from {filename}")
     
     def on_pdf_loaded(self, pixmap, positions, heights):
         self.progress_bar.setVisible(False)
@@ -838,9 +936,17 @@ class TriposTutorGUI(QWidget):
         
         # Scroll to target page
         if self.current_question and len(self.page_positions) > 0:
-            target_page = self.current_question['page'] - 1
+            page = self.current_question.get('page', 1)
+            # Handle both int and string page numbers
+            try:
+                target_page = int(page) - 1
+            except (ValueError, TypeError):
+                target_page = 0
+            
+            # Ensure target_page is within bounds
             if 0 <= target_page < len(self.page_positions):
-                scroll_pos = int(self.page_positions[target_page] * 800 / pixmap.width())
+                scale_factor = scaled.width() / pixmap.width()
+                scroll_pos = int(self.page_positions[target_page] * scale_factor)
                 QTimer.singleShot(100, lambda: self.question_scroll.verticalScrollBar().setValue(scroll_pos))
     
     def on_pdf_error(self, error_msg):
@@ -858,6 +964,9 @@ class TriposTutorGUI(QWidget):
         
         self.input_line.clear()
         
+        # Get question_id first for later use
+        question_id = self.current_question.get("id", "unknown")
+        
         # Handle commands
         if msg.lower() == "/next":
             self.on_next()
@@ -874,7 +983,7 @@ class TriposTutorGUI(QWidget):
         elif msg.lower() == "/clear":
             self.chat_history = []
             self.refresh_chat()
-            save_session_log(self.current_question["id"], self.chat_history)
+            save_session_log(question_id, self.chat_history)
             return
         
         # User message
@@ -884,7 +993,7 @@ class TriposTutorGUI(QWidget):
         # Get AI response
         chat_str = "\n".join([f"{m['role']}: {m['content']}" for m in self.chat_history[-10:]])
         response = ask_gemini_supervisor(
-            self.current_question['text'],
+            self.current_question.get('text', ''),
             msg,
             chat_str,
             self.hint_level
@@ -894,7 +1003,7 @@ class TriposTutorGUI(QWidget):
         self.display_ai(response)
         
         # Save session
-        save_session_log(self.current_question["id"], self.chat_history)
+        save_session_log(question_id, self.chat_history)
     
     def on_hint(self):
         if not self.current_question:
@@ -905,7 +1014,7 @@ class TriposTutorGUI(QWidget):
         
         chat_str = "\n".join([f"{m['role']}: {m['content']}" for m in self.chat_history[-10:]])
         response = ask_gemini_supervisor(
-            self.current_question['text'],
+            self.current_question.get('text', ''),
             f"I need a hint (level {self.hint_level})",
             chat_str,
             self.hint_level
@@ -917,7 +1026,8 @@ class TriposTutorGUI(QWidget):
         self.display_system(f"[Hint Level {self.hint_level}/3]")
         self.display_ai(response)
         
-        save_session_log(self.current_question["id"], self.chat_history)
+        question_id = self.current_question.get("id", "unknown")
+        save_session_log(question_id, self.chat_history)
     
     def show_full_answer(self):
         if not self.current_question:
@@ -925,9 +1035,11 @@ class TriposTutorGUI(QWidget):
         
         chat_str = "\n".join([f"{m['role']}: {m['content']}" for m in self.chat_history[-10:]])
         
+        question_text = self.current_question.get('text', 'No question text available')
+        
         prompt = f"""Provide a COMPLETE, detailed solution to this question:
 
-{self.current_question['text']}
+{question_text}
 
 Previous discussion:
 {chat_str}
@@ -950,7 +1062,8 @@ Now give the full answer with all steps, calculations, and explanations."""
         self.display_system("[📖 FULL SOLUTION]")
         self.display_ai(answer)
         
-        save_session_log(self.current_question["id"], self.chat_history)
+        question_id = self.current_question.get("id", "unknown")
+        save_session_log(question_id, self.chat_history)
     
     def on_next(self):
         if not self.current_matches:
@@ -966,7 +1079,7 @@ Now give the full answer with all steps, calculations, and explanations."""
             QMessageBox.warning(self, "No Question", "Select a question first!")
             return
         
-        qid = self.current_question["id"]
+        qid = self.current_question.get("id", "unknown")
         self.progress[qid] = {
             "solved": True,
             "date": datetime.now(timezone.utc).isoformat()
