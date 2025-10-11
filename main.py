@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-GEMINI_API_KEY = "AIzaSyDamaXEf7v-XvvEsfkSkgvDVAxMMog05hM"
+GEMINI_API_KEY = ""
 
 # UI
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
