@@ -1,4 +1,4 @@
-# generativeAIproject
+# Tripos_Tutor
 Weekend project using googles genai 
 
 Idea: TriposTutor
