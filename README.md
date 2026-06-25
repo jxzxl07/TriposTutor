@@ -1,4 +1,4 @@
-# Tripos_Tutor
+# Tripos Tutor
 Weekend project using googles genai 
 
 Idea: TriposTutor
